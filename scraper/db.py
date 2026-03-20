@@ -40,7 +40,12 @@ def upsert_products(rows: list[dict]) -> None:
         r = c.post(
             "/produkter",
             json=rows,
-            headers={**HEADERS, "Prefer": "resolution=merge-duplicates"},
+            headers={
+                **HEADERS,
+                "Prefer": "resolution=merge-duplicates",
+                "Content-Type": "application/json",
+            },
+            params={"on_conflict": "product_id"},
         )
         r.raise_for_status()
 
