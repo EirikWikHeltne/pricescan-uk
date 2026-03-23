@@ -1,104 +1,70 @@
 """
-Boots UK (boots.com) scraper.
-
-Uses the IBM WebSphere Commerce REST API directly — no browser needed.
-Endpoint: /search/resources/store/11352/productview/byPartNumber/{partNumber}
+Supabase client and query helpers for Karo UK Price Scanner.
 """
 
-import re
-from datetime import datetime, timezone
+import os
+from functools import lru_cache
 
 import httpx
 
-API_BASE = "https://www.boots.com/search/resources/store/11352/productview/byPartNumber"
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-    "Accept-Language": "en-GB,en;q=0.9",
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=minimal",
 }
 
 
-def _extract_part_number(url: str) -> str | None:
-    if not url:
-        return None
-    m = re.search(r'(\d{7,8})', url)
-    return m.group(1) if m else None
+def _client() -> httpx.Client:
+    return httpx.Client(
+        base_url=f"{SUPABASE_URL}/rest/v1",
+        headers=HEADERS,
+        timeout=30,
+    )
 
 
-def _fetch_product(client: httpx.Client, part_number: str) -> dict | None:
-    try:
-        r = client.get(f"{API_BASE}/{part_number}")
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        entries = data.get("catalogEntryView", [])
-        return entries[0] if entries else None
-    except Exception:
-        return None
+def get_active_products() -> list[dict]:
+    """Return all active products from the produkter table."""
+    with _client() as c:
+        r = c.get("/produkter", params={"active": "eq.true", "select": "*"})
+        r.raise_for_status()
+        return r.json()
 
 
-def _extract_price(entry: dict) -> tuple[float | None, float | None, bool]:
-    prices = entry.get("price", [])
-    offer_price = None
-    display_price = None
-
-    for p in prices:
-        val = p.get("value", "")
-        if not val:
-            continue
-        try:
-            amount = float(val)
-        except (ValueError, TypeError):
-            continue
-        usage = p.get("usage", "")
-        if usage == "Offer":
-            offer_price = amount
-        elif usage == "Display" and amount > 0:
-            display_price = amount
-
-    was_price = None
-    if display_price and offer_price and display_price > offer_price:
-        was_price = display_price
-
-    buyable = entry.get("buyable", "true") == "true"
-    return offer_price, was_price, buyable
+def upsert_products(rows: list[dict]) -> None:
+    """Upsert products into the produkter table."""
+    with _client() as c:
+        r = c.post(
+            "/produkter",
+            json=rows,
+            headers={
+                **HEADERS,
+                "Prefer": "resolution=merge-duplicates",
+                "Content-Type": "application/json",
+            },
+            params={"on_conflict": "product_id"},
+        )
+        r.raise_for_status()
 
 
-async def scrape_all(products: list[dict]) -> list[dict]:
-    results = []
-    now = datetime.now(timezone.utc).isoformat()
+def insert_prices(rows: list[dict]) -> None:
+    """Bulk insert price records."""
+    if not rows:
+        return
+    with _client() as c:
+        r = c.post("/prices", json=rows)
+        r.raise_for_status()
 
-    with httpx.Client(follow_redirects=True, timeout=15, headers=HEADERS) as client:
-        for p in products:
-            url = p.get("url", "")
-            part_number = _extract_part_number(url)
 
-            if not part_number:
-                print(f"  ⚠ {p['product']}: no part number in URL")
-                continue
-
-            entry = _fetch_product(client, part_number)
-            if not entry:
-                print(f"  ⚠ {p['product']}: API returned no data (PN: {part_number})")
-                continue
-
-            price, was_price, in_stock = _extract_price(entry)
-            if price is None:
-                print(f"  ⚠ {p['product']}: no price in API response")
-                continue
-
-            results.append({
-                "product_id": p["product_id"],
-                "retailer": "Boots UK",
-                "price": price,
-                "currency": "GBP",
-                "in_stock": in_stock,
-                "scraped_at": now,
-            })
-
-            promo = f" (was £{was_price:.2f}, -{round((1-price/was_price)*100)}%)" if was_price else ""
-            stock = " ✓" if in_stock else " [OOS]"
-            print(f"  ✓ {p['product']}: £{price:.2f}{promo}{stock}")
-
-    return results
+def update_product_url(product_id: str, url: str) -> None:
+    """Cache a resolved product URL back to the produkter table."""
+    with _client() as c:
+        r = c.patch(
+            "/produkter",
+            params={"product_id": f"eq.{product_id}"},
+            json={"url": url},
+        )
+        r.raise_for_status()
